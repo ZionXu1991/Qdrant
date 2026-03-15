@@ -1,0 +1,69 @@
+sequenceDiagram
+    autonumber
+    title Change Approval Update API - End-to-End Sequence Diagram
+
+    participant User as Staff User<br/>(SSO)
+    participant App as Integration App<br/>(GBGF Portal)
+    participant Browser as Browser
+    participant StaffDSP as Staff DSP<br/>(/Authenticate)
+    participant WDSSO as WDSSO<br/>(SSO Provider)
+    participant STS as Staff DSP<br/>(/tokenTranslate + STS)
+    participant Kong as Kong API Gateway<br/>(AuthN Plugin)
+    participant OpenAM as OpenAM<br/>(IdP)
+    participant SNOW as ServiceNow<br/>(Change Approval)
+
+    note over User,SNOW: ═══ PHASE 1: Staff SSO Authentication (Get AMToken) ═══
+
+    User ->> Browser: Access Integration App
+    Browser ->> App: 1. Fetch UI Resources (Non-API, unprotected)
+    App -->> Browser: Return UI pages
+
+    Browser ->> StaffDSP: 2. AJAX call /authenticate<br/>Headers: X-Client-Id, X-Client-Secret<br/>(No username/password needed)
+    StaffDSP ->> StaffDSP: Verify Consumer Node
+    StaffDSP ->> WDSSO: Redirect for SSO
+    WDSSO -->> StaffDSP: SSO credentials validated
+    StaffDSP -->> Browser: Return AMToken cookie ✅<br/>(⚠️ Use cookie only, not body token)
+
+    note over User,SNOW: ═══ PHASE 2: Translate AMToken → Staff E2E JWT ═══
+
+    Browser ->> App: 3. Initiate API call (with AMToken)
+    App ->> STS: 4. Call /tokenTranslate<br/>with AMToken cookie
+    STS ->> STS: STS translates AMToken<br/>to Staff E2E JWT
+    STS -->> App: Return Staff E2E JWT ✅<br/>(⚠️ Token expires in 30 seconds!)
+
+    note over User,SNOW: ═══ PHASE 3: Call Change Approval API (Two-Level Auth) ═══
+
+    rect rgb(40, 60, 40)
+        note right of App: Request Headers:<br/>Authorization: Basic {svc_acct}<br/>X-Staff-SNOW-E2E-Token: {jwt}<br/><br/>Request Body:<br/>{ "requestor": "{staffId}", ... }
+
+        App ->> Kong: 5. POST hsbcc/itsm/change/approval
+
+        note over Kong: ── Level 1: Service Account Auth ──
+        Kong ->> OpenAM: 6. Validate Service Account<br/>(BasicAuth credentials)
+        OpenAM -->> Kong: Service Account verified ✅<br/>E2E trust token generated
+
+        note over Kong: ── Level 2: Staff Identity Auth ──
+        Kong ->> Kong: 7. Verify X-Staff-SNOW-E2E-Token<br/>Extract StaffId from JWT
+        Kong ->> Kong: 8. Match StaffId == requestor field<br/>in request payload
+
+        alt StaffId matches requestor
+            Kong ->> SNOW: 9. Forward approved request<br/>(with e2e-token-trust-header)
+            SNOW ->> SNOW: Process CR Approve/Reject
+            SNOW -->> Kong: CR Result (Approved/Rejected)
+            Kong -->> App: 200 OK - CR Updated ✅
+            App -->> Browser: Display result to user
+        else StaffId does NOT match requestor
+            Kong -->> App: 403 Forbidden ❌<br/>(Impersonation blocked)
+        end
+    end
+
+    note over User,SNOW: ═══ ERROR HANDLING ═══
+
+    rect rgb(60, 40, 40)
+        note over App,Kong: If AMToken expired (401 from AuthN)
+        App ->> StaffDSP: Re-call /authenticate (SSO)
+        StaffDSP -->> App: New AMToken cookie
+        App ->> STS: Re-call /tokenTranslate
+        STS -->> App: New Staff E2E JWT
+        App ->> Kong: Retry API call with new tokens
+    end

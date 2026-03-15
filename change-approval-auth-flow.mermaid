@@ -1,0 +1,127 @@
+sequenceDiagram
+    autonumber
+    title Change Approval Update API — Complete Authentication Flow
+
+    actor Staff as 👤 Staff User
+    participant Browser as 🖥️ Browser<br/>(Integration App)
+    participant StaffAuth as Staff DSP<br/>/Authenticate
+    participant WDSSO as WDSSO<br/>(SSO Provider)
+    participant ConsNode as Verify<br/>Consumer Node
+    participant TokenTx as Staff DSP<br/>/tokenTranslate
+    participant STS as STS<br/>(Security Token Service)
+    participant Kong as Kong API Gateway<br/>(AuthN Plugin)
+    participant OpenAM as OpenAM<br/>(IdP)
+    participant SNOW as ServiceNow
+
+    %% ============================================================
+    note over Staff,SNOW: 🔐 LEVEL 2 — Staff Identity Authentication (DSP Staff Pattern)
+    %% ============================================================
+
+    rect rgb(45, 25, 60)
+        note over Browser,WDSSO: Step A: Obtain AMToken via SSO
+
+        Staff ->> Browser: Access Integration App
+        Browser ->> Browser: Fetch UI Resources<br/>(Non-API, unprotected)
+
+        Browser ->> StaffAuth: AJAX POST /authenticate<br/>Headers: X-Client-Id, X-Client-Secret<br/>(for API tracking, NOT user auth)
+
+        StaffAuth ->> ConsNode: Verify Consumer Node
+        ConsNode -->> StaffAuth: Consumer verified ✓
+
+        StaffAuth ->> WDSSO: Redirect to SSO
+        note right of WDSSO: SSO handles user identity<br/>No username/password<br/>needed from app
+        WDSSO -->> StaffAuth: SSO credentials validated ✓
+
+        StaffAuth -->> Browser: Set-Cookie: AMToken=xxx ✅
+        note over Browser: ⚠️ Use cookie ONLY<br/>Body token NOT recommended
+    end
+
+    rect rgb(45, 25, 60)
+        note over Browser,STS: Step B: Translate AMToken → Staff E2E JWT
+
+        Browser ->> TokenTx: POST /tokenTranslate<br/>Cookie: AMToken=xxx
+        TokenTx ->> STS: Translate AMToken
+        STS ->> STS: Generate Staff E2E JWT<br/>(contains StaffId, groups, expiry)
+        STS -->> TokenTx: Staff E2E JWT
+        TokenTx -->> Browser: Return JWT ✅
+        note over Browser: ⚠️ JWT expires in 30 seconds!<br/>Must complete API call within TTL
+    end
+
+    %% ============================================================
+    note over Staff,SNOW: 🔑 LEVEL 1 — Service Account Authentication (DSP iB2B Pattern 2)
+    %% ============================================================
+
+    rect rgb(25, 45, 35)
+        note over Kong,OpenAM: Handled transparently by Kong AuthN Plugin
+
+        Browser ->> Kong: POST hsbcc/itsm/change/approval<br/>━━━━━━━━━━━━━━━━━━━━━━<br/>Authorization: Basic {svc_account}<br/>X-Staff-SNOW-E2E-Token: {jwt}<br/>━━━━━━━━━━━━━━━━━━━━━━<br/>Body: { "requestor": "{staffId}" }
+
+        Kong ->> OpenAM: Forward BasicAuth credentials
+        note right of OpenAM: Validate Service Account<br/>via iB2B Pattern 2 (V2)
+        OpenAM ->> OpenAM: Verify credentials
+        OpenAM -->> Kong: Service Account valid ✓<br/>Internal E2E trust token generated
+
+        note over Kong: Kong populates<br/>x-hsbc-e2e-token-trust-header
+    end
+
+    %% ============================================================
+    note over Staff,SNOW: ✅ DUAL VALIDATION — Identity Match & Authorization
+    %% ============================================================
+
+    rect rgb(25, 50, 50)
+        Kong ->> Kong: Extract StaffId from<br/>X-Staff-SNOW-E2E-Token JWT
+
+        Kong ->> Kong: Validate JWT signature & expiry<br/>(JWT validator policy)
+
+        Kong ->> Kong: Validate group authorization<br/>(cmb-secure-access-authz policy)
+
+        alt ✅ StaffId == requestor in payload
+            Kong ->> Kong: Identity match confirmed ✓
+
+            Kong ->> SNOW: Forward request<br/>(with e2e-token-trust-header)
+            SNOW ->> SNOW: Process Change Request<br/>Approve or Reject
+
+            SNOW -->> Kong: CR Result
+            Kong -->> Browser: 200 OK ✅
+            Browser -->> Staff: Display: CR Updated
+        else ❌ StaffId != requestor
+            Kong -->> Browser: 403 Forbidden ❌<br/>Impersonation attempt blocked
+            Browser -->> Staff: Error: Identity mismatch
+        end
+    end
+
+    %% ============================================================
+    note over Staff,SNOW: 🔄 ERROR RECOVERY FLOWS
+    %% ============================================================
+
+    rect rgb(60, 35, 30)
+        note over Browser,Kong: Scenario: AMToken Expired (401)
+
+        Kong -->> Browser: 401 Unauthorized
+        Browser ->> Browser: Detect 401 response<br/>Trigger re-authentication
+
+        Browser ->> StaffAuth: Re-call /authenticate (SSO)
+        StaffAuth ->> WDSSO: Re-validate SSO
+        WDSSO -->> StaffAuth: Valid ✓
+        StaffAuth -->> Browser: New AMToken cookie ✅
+
+        Browser ->> TokenTx: /tokenTranslate (new AMToken)
+        TokenTx ->> STS: Translate
+        STS -->> TokenTx: New JWT
+        TokenTx -->> Browser: New Staff E2E JWT ✅
+
+        Browser ->> Kong: Retry API call with new tokens
+        Kong -->> Browser: 200 OK ✅
+    end
+
+    rect rgb(60, 50, 25)
+        note over Kong,OpenAM: Scenario: Service Account Cache Stale
+
+        Kong ->> OpenAM: Validate new credentials
+        OpenAM -->> Kong: 401 — old credentials still cached
+
+        note over Kong,OpenAM: ⏳ Wait for DSP cache expiry:<br/>Production: 30 minutes<br/>Non-Production: 4 hours
+
+        Kong ->> OpenAM: Retry after cache expiry
+        OpenAM -->> Kong: New credentials valid ✅
+    end
